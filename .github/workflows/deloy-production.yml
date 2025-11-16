@@ -1,0 +1,289 @@
+name: Auto Deploy Foodfast to EC2
+
+on:
+  # Tự chạy sau khi workflow build image xong - CHỈ NHÁNH MAIN
+  workflow_run:
+    workflows:
+      - Docker Build and Push     # tên workflow build của bạn
+    types:
+      - completed
+    branches:
+      - main                      # CHỈ deploy nhánh main
+  # Cho phép bấm tay để deploy lại (chỉ dành cho main)
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  OWNER: ${{ github.repository_owner }}
+
+jobs:
+  deploy:
+    # CHỈ chạy nếu:
+    # 1. Build của nhánh MAIN thành công, HOẶC
+    # 2. Chạy tay (workflow_dispatch) - nhưng vẫn phải kiểm tra nhánh
+    if: |
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main') ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+
+    steps:
+      # ======================
+      # 1) Checkout
+      # ======================
+      - name: Checkout (from workflow_run)
+        if: ${{ github.event_name == 'workflow_run' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Checkout (manual)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/checkout@v4
+
+      - name: Verify branch is main
+        if: github.event_name == 'workflow_run'
+        run: |
+          BRANCH_NAME=${{ github.event.workflow_run.head_branch }}
+          echo "Triggering branch is: $BRANCH_NAME"
+          if [ "$BRANCH_NAME" != "main" ]; then
+            echo "Deployment is only allowed from the 'main' branch. Aborting."
+            exit 1
+          fi
+
+      # ======================
+      # 2) Xác định tag image sẽ dùng để deploy
+      # ======================
+      - name: Decide image tag
+        id: imagetag
+        run: |
+          TAG="latest"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "✅ Will deploy image tag: $TAG (main branch only)"
+
+      # ======================
+      # 3) SSH Setup
+      # ======================
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.PROD_SSH_KEY }}
+
+      - name: Add EC2 to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.PROD_SERVER_HOST }} >> ~/.ssh/known_hosts
+
+      # ======================
+      # 4) Sync monitoring configs to EC2
+      # ======================
+      - name: Sync monitoring configs to EC2
+        env:
+          SERVER_HOST: ${{ secrets.PROD_SERVER_HOST }}
+          SERVER_USER: ${{ secrets.PROD_SERVER_USER }}
+        run: |
+          echo "Syncing monitoring configs to EC2..."
+          ssh $SERVER_USER@$SERVER_HOST "mkdir -p ~/prometheus-config ~/grafana-config/provisioning/datasources ~/grafana-config/provisioning/dashboards ~/grafana-config/dashboards"
+          scp monitoring/prometheus.yml $SERVER_USER@$SERVER_HOST:~/prometheus-config/
+          scp monitoring/alerts.yml $SERVER_USER@$SERVER_HOST:~/prometheus-config/
+          scp monitoring/grafana/datasources.yml $SERVER_USER@$SERVER_HOST:~/grafana-config/provisioning/datasources/
+          scp monitoring/grafana/dashboards.yml $SERVER_USER@$SERVER_HOST:~/grafana-config/provisioning/dashboards/
+          scp monitoring/grafana/foodfast-dashboard.json $SERVER_USER@$SERVER_HOST:~/grafana-config/dashboards/
+          scp monitoring/grafana/cicd-dashboard.json $SERVER_USER@$SERVER_HOST:~/grafana-config/dashboards/
+          echo "✅ Monitoring configs synced to prometheus-config and grafana-config"
+
+      # ======================
+      # 5) Tạo script deploy để chép lên EC2
+      # ======================
+      - name: Create remote script
+        run: |
+          cat > remote-deploy.sh <<'SCRIPT'
+          set -e
+
+          REGISTRY="${REGISTRY}"
+          OWNER="${OWNER}"
+          IMAGE_TAG="${IMAGE_TAG}"
+          GHCR_TOKEN="${GHCR_TOKEN}"
+          MONGO_URI="${MONGO_URI}"
+          JWT_SECRET="${JWT_SECRET}"
+          JWT_EXPIRE="${JWT_EXPIRE}"
+          CLOUDINARY_CLOUD_NAME="${CLOUDINARY_CLOUD_NAME}"
+          CLOUDINARY_API_KEY="${CLOUDINARY_API_KEY}"
+          CLOUDINARY_API_SECRET="${CLOUDINARY_API_SECRET}"
+
+          echo "==> Login GHCR as \$OWNER"
+          echo "${GHCR_TOKEN}" | sudo docker login ghcr.io -u "${OWNER}" --password-stdin
+
+          echo "==> Create network"
+          sudo docker network create foodfast-net || true
+
+          echo "=== Deploy foodfast-server:\${IMAGE_TAG} ==="
+          sudo docker pull "${REGISTRY}/${OWNER}/foodfast-server:${IMAGE_TAG}"
+          sudo docker rm -f foodfast-server 2>/dev/null || true
+          sudo docker run -d --name foodfast-server --restart unless-stopped \
+            --network foodfast-net --network-alias server_app \
+            -p 5000:5000 \
+            -e MONGO_URI="${MONGO_URI}" \
+            -e JWT_SECRET="${JWT_SECRET}" \
+            -e JWT_EXPIRE="${JWT_EXPIRE}" \
+            -e NODE_ENV="production" \
+            -e PORT="5000" \
+            -e CLOUDINARY_CLOUD_NAME="${CLOUDINARY_CLOUD_NAME}" \
+            -e CLOUDINARY_API_KEY="${CLOUDINARY_API_KEY}" \
+            -e CLOUDINARY_API_SECRET="${CLOUDINARY_API_SECRET}" \
+            "${REGISTRY}/${OWNER}/foodfast-server:${IMAGE_TAG}"
+
+          echo "=== Deploy foodfast-client:\${IMAGE_TAG} ==="
+          sudo docker pull "${REGISTRY}/${OWNER}/foodfast-client:${IMAGE_TAG}"
+          sudo docker rm -f foodfast-client 2>/dev/null || true
+          sudo docker run -d --name foodfast-client --restart unless-stopped \
+            --network foodfast-net \
+            -p 3000:80 \
+            "${REGISTRY}/${OWNER}/foodfast-client:${IMAGE_TAG}"
+
+          echo "=== Deploy foodfast-admin:\${IMAGE_TAG} ==="
+          sudo docker pull "${REGISTRY}/${OWNER}/foodfast-admin:${IMAGE_TAG}"
+          sudo docker rm -f foodfast-admin 2>/dev/null || true
+          sudo docker run -d --name foodfast-admin --restart unless-stopped \
+            --network foodfast-net \
+            -p 3001:80 \
+            "${REGISTRY}/${OWNER}/foodfast-admin:${IMAGE_TAG}"
+
+          echo "=== Deploy foodfast-restaurant:\${IMAGE_TAG} ==="
+          sudo docker pull "${REGISTRY}/${OWNER}/foodfast-restaurant:${IMAGE_TAG}"
+          sudo docker rm -f foodfast-restaurant 2>/dev/null || true
+          sudo docker run -d --name foodfast-restaurant --restart unless-stopped \
+            --network foodfast-net \
+            -p 3002:80 \
+            "${REGISTRY}/${OWNER}/foodfast-restaurant:${IMAGE_TAG}"
+
+          echo "=== Deploy foodfast-drone:\${IMAGE_TAG} ==="
+          sudo docker pull "${REGISTRY}/${OWNER}/foodfast-drone:${IMAGE_TAG}"
+          sudo docker rm -f foodfast-drone 2>/dev/null || true
+          sudo docker run -d --name foodfast-drone --restart unless-stopped \
+            --network foodfast-net \
+            "${REGISTRY}/${OWNER}/foodfast-drone:${IMAGE_TAG}"
+
+          echo "=== Deploy Prometheus ==="
+          sudo docker pull prom/prometheus:latest
+          sudo docker rm -f foodfast-prometheus 2>/dev/null || true
+          
+          # Config files đã được sync vào ~/prometheus-config trước đó
+          sudo docker run -d --name foodfast-prometheus --restart unless-stopped \
+            --network foodfast-net --network-alias prometheus \
+            -p 9090:9090 \
+            -v ~/prometheus-config:/etc/prometheus \
+            -v prometheus_data:/prometheus \
+            prom/prometheus:latest \
+            --config.file=/etc/prometheus/prometheus.yml \
+            --storage.tsdb.path=/prometheus \
+            --storage.tsdb.retention.time=30d \
+            --storage.tsdb.retention.size=10GB \
+            --web.console.libraries=/usr/share/prometheus/console_libraries \
+            --web.console.templates=/usr/share/prometheus/consoles
+
+          echo "=== Deploy Grafana ==="
+          sudo docker pull grafana/grafana:latest
+          sudo docker rm -f foodfast-grafana 2>/dev/null || true
+          
+          # Config files đã được sync vào ~/grafana-config trước đó
+          sudo docker run -d --name foodfast-grafana --restart unless-stopped \
+            --network foodfast-net --network-alias grafana \
+            -p 3030:3000 \
+            -e GF_SECURITY_ADMIN_PASSWORD=admin123 \
+            -e GF_USERS_ALLOW_SIGN_UP=false \
+            -v ~/grafana-config/provisioning:/etc/grafana/provisioning \
+            -v ~/grafana-config/dashboards:/etc/grafana/dashboards \
+            -v grafana_data:/var/lib/grafana \
+            grafana/grafana:latest
+
+          echo "=== Deploy Node Exporter ==="
+          sudo docker pull prom/node-exporter:latest
+          sudo docker rm -f foodfast-node-exporter 2>/dev/null || true
+          sudo docker run -d --name foodfast-node-exporter --restart unless-stopped \
+            --network foodfast-net --network-alias node-exporter \
+            -p 9100:9100 \
+            prom/node-exporter:latest
+
+          echo "=== Deploy cAdvisor ==="
+          sudo docker pull gcr.io/cadvisor/cadvisor:latest
+          sudo docker rm -f foodfast-cadvisor 2>/dev/null || true
+          sudo docker run -d --name foodfast-cadvisor --restart unless-stopped \
+            --network foodfast-net --network-alias cadvisor \
+            -p 8080:8080 \
+            -v /:/rootfs:ro \
+            -v /var/run:/var/run:ro \
+            -v /sys:/sys:ro \
+            -v /var/lib/docker/:/var/lib/docker:ro \
+            -v /dev/disk/:/dev/disk:ro \
+            gcr.io/cadvisor/cadvisor:latest
+
+          echo "=== Deploy Pushgateway ==="
+          sudo docker pull prom/pushgateway:latest
+          sudo docker rm -f foodfast-pushgateway 2>/dev/null || true
+          sudo docker run -d --name foodfast-pushgateway --restart unless-stopped \
+            --network foodfast-net --network-alias pushgateway \
+            -p 9091:9091 \
+            -v pushgateway_data:/data \
+            prom/pushgateway:latest \
+            --persistence.file=/data/pushgateway.data \
+            --persistence.interval=5m
+
+          echo "✅ Deploy done (including monitoring stack)."
+          SCRIPT
+
+      # ======================
+      # 6) Chạy script trên EC2
+      # ======================
+      - name: Run remote script on EC2
+        env:
+          SERVER_HOST: ${{ secrets.PROD_SERVER_HOST }}
+          SERVER_USER: ${{ secrets.PROD_SERVER_USER }}
+          REGISTRY: ${{ env.REGISTRY }}
+          OWNER: ${{ env.OWNER }}
+          IMAGE_TAG: ${{ steps.imagetag.outputs.tag }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          JWT_EXPIRE: ${{ secrets.JWT_EXPIRE }}
+          CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+        run: |
+          echo "Connecting to $SERVER_USER@$SERVER_HOST ..."
+          echo "Deploying with image tag: ${IMAGE_TAG}"
+
+          scp remote-deploy.sh $SERVER_USER@$SERVER_HOST:/tmp/remote-deploy.sh
+
+          ssh $SERVER_USER@$SERVER_HOST "chmod +x /tmp/remote-deploy.sh && \
+            REGISTRY='${REGISTRY}' \
+            OWNER='${OWNER}' \
+            IMAGE_TAG='${IMAGE_TAG}' \
+            GHCR_TOKEN='${GHCR_TOKEN}' \
+            MONGO_URI='${MONGO_URI}' \
+            JWT_SECRET='${JWT_SECRET}' \
+            JWT_EXPIRE='${JWT_EXPIRE}' \
+            CLOUDINARY_CLOUD_NAME='${CLOUDINARY_CLOUD_NAME}' \
+            CLOUDINARY_API_KEY='${CLOUDINARY_API_KEY}' \
+            CLOUDINARY_API_SECRET='${CLOUDINARY_API_SECRET}' \
+            /tmp/remote-deploy.sh"
+
+      # ======================
+      # 7) Healthcheck
+      # ======================
+      - name: Healthcheck backend
+        run: |
+          echo "Waiting for backend..."
+          for i in {1..6}; do
+            echo "Attempt $i"
+            if curl -f http://${{ secrets.PROD_SERVER_HOST }}:5000/health \
+              || curl -f http://${{ secrets.PROD_SERVER_HOST }}:5000/api/health \
+              || curl -f http://${{ secrets.PROD_SERVER_HOST }}:5000/ ; then
+              echo "✅ Backend is up"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "❌ Backend is NOT responding on port 5000"
+          exit 1
