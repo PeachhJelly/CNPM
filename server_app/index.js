@@ -14,8 +14,29 @@ const { register, metricsMiddleware, updateBusinessMetrics, updateMongoMetrics }
 // Load environment variables from root directory
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
-// Connect to MongoDB
-connectDB();
+// Connect to MongoDB (supports an in-memory server for local dev)
+async function startServer() {
+    // Optional: use in-memory MongoDB for local development/tests
+    if (process.env.USE_IN_MEMORY_DB === '1' || process.env.USE_IN_MEMORY_DB === 'true') {
+        try {
+            const { MongoMemoryServer } = require('mongodb-memory-server')
+            const mongod = await MongoMemoryServer.create()
+            const uri = mongod.getUri()
+            process.env.MONGO_URI = uri
+            console.log('Using in-memory MongoDB for development')
+        } catch (err) {
+            console.error('Failed to start in-memory MongoDB:', err)
+        }
+    }
+
+    // Connect to configured MongoDB URI
+    await connectDB();
+}
+
+startServer().catch((err) => {
+    console.error('Failed to start server initialisation:', err)
+    process.exit(1)
+})
 
 const app = express();
 
