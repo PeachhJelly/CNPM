@@ -158,7 +158,7 @@ const vnpayReturn = asyncHandler(async (req, res) => {
                     
                     // Hoàn trả (refund)
                     '04': 'Không cho phép hoàn trả toàn phần sau khi hoàn trả một phần',
-                    '13': 'Chỉ cho phép hoàn trả một phần',
+                    '13_refund': 'Chỉ cho phép hoàn trả một phần',
                     '93': 'Số tiền hoàn trả không hợp lệ. Số tiền hoàn trả phải nhỏ hơn hoặc bằng số tiền thanh toán.',
                     '95': 'Giao dịch này không thành công bên VNPAY. VNPAY từ chối xử lý yêu cầu.',
                 }
@@ -400,7 +400,7 @@ const vnpayIPN = asyncHandler(async (req, res) => {
                                 
                                 // Hoàn trả (refund)
                                 '04': 'Không cho phép hoàn trả toàn phần sau khi hoàn trả một phần',
-                                '13': 'Chỉ cho phép hoàn trả một phần',
+                                '13_refund': 'Chỉ cho phép hoàn trả một phần',
                                 '93': 'Số tiền hoàn trả không hợp lệ. Số tiền hoàn trả phải nhỏ hơn hoặc bằng số tiền thanh toán.',
                                 '95': 'Giao dịch này không thành công bên VNPAY. VNPAY từ chối xử lý yêu cầu.',
                             }
@@ -702,7 +702,7 @@ function sortObject(obj) {
     let str = [];
     let key;
     for (key in obj) {
-        if (obj.hasOwnProperty(key)) {
+        if (Object.prototype.hasOwnProperty.call(obj, key)) {
             str.push(encodeURIComponent(key));
         }
     }
