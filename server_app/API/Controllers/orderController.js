@@ -491,6 +491,7 @@ const createOrder = asyncHandler(async(req, res) => {
 
     // Emit order:created event for real-time updates to all connected clients
     try {
+        const io = req.app.get('io')
         const createdPayload = {
             orderId: order._id,
             orderNumber: order.orderNumber,
@@ -500,8 +501,10 @@ const createOrder = asyncHandler(async(req, res) => {
         }
         
         console.log('📡 [SERVER] Emitting order:created globally:', createdPayload)
-        io.emit('order:created', createdPayload)
-        io.to('admin-room').emit('order:created', createdPayload)
+        if (io) {
+            io.emit('order:created', createdPayload)
+            io.to('admin-room').emit('order:created', createdPayload)
+        }
         console.log('✅ Emitted order:created event globally and to admin-room')
     } catch (e) {
         console.error('Failed to emit order:created:', e)
